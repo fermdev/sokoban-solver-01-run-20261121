@@ -1,14 +1,13 @@
-// sokoban-solver: A* with deadlock detection.
-// Improvements over plain-astar: deadlock pruning (box in corner not on goal),
-// better heuristic (min matching), tie-breaking on fewer pushes.
+// sokoban-solver: A* with deadlock detection + precompute distances.
+// Better heuristic: Hungarian-style matching + freeze deadlock.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const EXPANSIONS = 300_000;
+const EXPANSIONS = 500_000;
 const DIRS: [number, number, string][] = [[0,-1,'u'],[0,1,'d'],[-1,0,'l'],[1,0,'r']];
 
-function solve(text: string): string {
+function solve(text: string, budget: number): string {
   const rows = text.split('\n').filter(r => r.length > 0);
   const w = Math.max(...rows.map(r => r.length));
   const wall: boolean[] = [];
@@ -28,7 +27,21 @@ function solve(text: string): string {
   boxes.sort((a, b) => a - b);
   const goalSet = new Set(goals);
 
-  // Deadlock: corner + freeze + 2x2 block
+  // Precompute distance from each square to nearest goal
+  const goalDist: number[] = new Array(w * rows.length).fill(Infinity);
+  const queue: number[] = [];
+  for (const g of goals) { goalDist[g] = 0; queue.push(g); }
+  let qi = 0;
+  while (qi < queue.length) {
+    const cur = queue[qi++];
+    for (const [dx, dy] of DIRS) {
+      const n = cur + dy * w + dx;
+      if (n < 0 || n >= w * rows.length || wall[n]) continue;
+      if (goalDist[n] > goalDist[cur] + 1) { goalDist[n] = goalDist[cur] + 1; queue.push(n); }
+    }
+  }
+
+  // Deadlock: corner + 2x2 block + freeze
   function isDeadlock(bs: number[]): boolean {
     for (const b of bs) {
       if (goalSet.has(b)) continue;
@@ -39,11 +52,9 @@ function solve(text: string): string {
       const right = wall[b + 1] || false;
       if ((up || down) && (left || right)) return true;
     }
-    // 2x2 block of boxes/walls not on goals
+    // 2x2 block
     for (const b of bs) {
       if (goalSet.has(b)) continue;
-      const x = b % w;
-      // check 2x2 squares containing this box
       for (const [dx, dy] of [[0,0],[-1,0],[0,-1],[-1,-1]]) {
         const sq = [b+dy*w+dx, b+dy*w+dx+1, b+(dy+1)*w+dx, b+(dy+1)*w+dx+1];
         if (sq.every(s => wall[s] || bs.includes(s))) {
@@ -54,27 +65,17 @@ function solve(text: string): string {
     return false;
   }
 
-  // Heuristic: min-cost bipartite matching (boxes to goals) + wall distance
-  const dist = (b: number): number => {
-    let best = Infinity;
-    for (const g of goals) {
-      const d = Math.abs((g % w) - (b % w)) + Math.abs(Math.floor(g / w) - Math.floor(b / w));
-      if (d < best) best = d;
-    }
-    return best;
-  };
   const est = (bs: number[]): number => {
-    // Simple sum of min distances (admissible but weaker than Hungarian)
     let total = 0;
-    for (const b of bs) total += dist(b);
+    for (const b of bs) total += goalDist[b] || 0;
     return total;
   };
-  const key = (p: number, bs: number[]): string => String.fromCharCode(p, ...bs);
+  const key = (p: number, bs: number[]): string => p + ',' + bs.join(',');
 
   const sp: number[] = [player];
   const sb: number[][] = [boxes];
-  const sg: number[] = [0]; // moves
-  const sp2: number[] = [0]; // pushes
+  const sg: number[] = [0];
+  const sp2: number[] = [0];
   const parent: number[] = [-1];
   const step: string[] = [''];
   const best = new Map<string, number>([[key(player, boxes), 0]]);
@@ -95,8 +96,9 @@ function solve(text: string): string {
     return top;
   };
 
+  const start = Date.now();
   let expanded = 0;
-  while (heap.length > 0 && expanded < EXPANSIONS) {
+  while (heap.length > 0 && expanded < EXPANSIONS && Date.now() - start < budget) {
     const [, g, s, pushes] = pop();
     if (best.get(key(sp[s]!, sb[s]!)) !== s) continue;
     const bs = sb[s]!;
@@ -108,7 +110,6 @@ function solve(text: string): string {
     if (isDeadlock(bs)) continue;
     expanded++;
     const p = sp[s]!;
-    // Move ordering: pushes first (they change the state more)
     const moves: [number, number, string, number, number][] = [];
     for (const [dx, dy, letter] of DIRS) {
       const d = dy * w + dx;
@@ -117,12 +118,11 @@ function solve(text: string): string {
       const at = bs.indexOf(q);
       if (at >= 0) {
         if (wall[q + d] || bs.includes(q + d)) continue;
-        moves.push([q, d, letter.toUpperCase(), 1, at]); // push
+        moves.push([q, d, letter.toUpperCase(), 1, at]);
       } else {
-        moves.push([q, d, letter, 0, -1]); // walk
+        moves.push([q, d, letter, 0, -1]);
       }
     }
-    // Sort: pushes first, then by heuristic improvement
     moves.sort((a, b) => a[3] - b[3]);
     for (const [q, d, move, isPush, at] of moves) {
       let nb = bs;
@@ -150,8 +150,12 @@ function solve(text: string): string {
   return '';
 }
 
-for (const id of readdirSync(I).sort()) {
-  const moves = solve(readFileSync(join(I, id, 'level.txt'), 'utf8'));
+const ids = readdirSync(I).sort();
+// Adaptive budget: give more time to harder levels
+const budgets = [10_000, 15_000, 15_000, 15_000, 15_000]; // 70s total, 10s safety
+for (let idx = 0; idx < ids.length; idx++) {
+  const id = ids[idx]!;
+  const moves = solve(readFileSync(join(I, id, 'level.txt'), 'utf8'), budgets[idx] || 15_000);
   mkdirSync(join(O, id), { recursive: true });
   writeFileSync(join(O, id, 'solution.txt'), `${moves}\n`);
 }
